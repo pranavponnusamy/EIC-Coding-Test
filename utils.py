@@ -1,20 +1,21 @@
-from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
 from transformers.pytorch_utils import Conv1D
 from dataclasses import dataclass
 import torch.nn as nn
 from transformers import AutoConfig
 import torch.autograd
+from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
 
 @dataclass
 class quantConfig():
-    W_bit: int = 12
-    A_bit: int = 12
-    KV_bit: int = 14
+    W_bit: int = 4
+    A_bit: int = 8
+    KV_bit: int = 4
     A_layerwise: bool = False
     W_layerwise: bool = True
+    KV_layerwise: bool = False
     A_quant_method: str = "symmetric"
     layerwise: bool = False
-    gradclip: tuple = (0, 0)
+    gradclip: tuple = None  # None means no gradient clipping during training
 
 class SymQuantization(torch.autograd.Function):
     @staticmethod
@@ -23,7 +24,7 @@ class SymQuantization(torch.autograd.Function):
         ctx.clip_val = clip_val 
         
         if layerwise:
-            max_val = torch.max(input.max(dim=1)[0])
+            max_val = torch.max(torch.abs(input))
         else:
             if input.ndimension() <= 3:
                 # weight & hidden layer
@@ -34,7 +35,7 @@ class SymQuantization(torch.autograd.Function):
                 )
             elif input.ndimension() == 4:
                 # TODO: attention score matrix, calculate alpha / beta per head
-                tmp = input.view(input.shape[0], input.shape[1], -1)
+                tmp = input.reshape(input.shape[0], input.shape[1], -1)
                 max_val = (
                     torch.max(torch.abs(tmp), dim=-1, keepdim=True)[0]
                     .unsqueeze(-1)
@@ -47,7 +48,7 @@ class SymQuantization(torch.autograd.Function):
         # quantize and dequantize the input
         # we add a small epsilon to avoid division by zero
         alpha = max_val / ((2**(num_bits - 1) - 1) + 1e-6)
-        X_q = torch.round(input / (alpha + 1e-6)) * alpha
+        X_q = torch.round(input / alpha) * alpha
 
         return X_q
 
@@ -92,3 +93,34 @@ class QuantLinear(nn.Module):
             return out
         else:
             return nn.functional.linear(act, weight, self.bias)
+
+
+def quantize_model(model, quant_config=quantConfig(), skip_layers=None):
+    """
+    Quantize model layers.
+    
+    Args:
+        skip_layers: list of layer names to skip (e.g., ['lm_head'] to preserve output quality)
+    """
+    if skip_layers is None:
+        skip_layers = ['lm_head']  # Don't quantize the output projection by default
+    
+    for name, module in model.named_modules():
+        if isinstance(module, GPT2Attention):
+            # print(module.state_dict())
+            print((module.c_attn.weight.shape))
+            # setattr(parent, child_name, GPTQuantAtttention(module, quant_config))
+    
+    replacements = []
+    for name, module in model.named_modules():
+        for child_name, child in module.named_children():
+            full_name = f"{name}.{child_name}" if name else child_name
+            if any(skip in full_name for skip in skip_layers):
+                print(f"Skipping quantization for: {full_name}")
+                continue
+            if isinstance(child, (Conv1D, nn.Linear)) and not isinstance(child, QuantLinear):
+                replacements.append((module, child_name, child))
+    
+    for parent, child_name, child in replacements:
+        setattr(parent, child_name, QuantLinear(child, quant_config))
+    return model
