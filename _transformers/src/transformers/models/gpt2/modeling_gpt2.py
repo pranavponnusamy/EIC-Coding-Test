@@ -19,11 +19,13 @@ import math
 import os
 import warnings
 from dataclasses import dataclass
-from typing import Callable, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import torch
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+
+from utils.utils import QuantBlockConfig, QuantLinear
 
 from ...activations import ACT2FN, get_activation
 from ...cache_utils import Cache, DynamicCache, EncoderDecoderCache
@@ -156,11 +158,13 @@ def eager_attention_forward(module, query, key, value, attention_mask, head_mask
     return attn_output, attn_weights
 
 
-class GPT2Attention(nn.Module):
-    def __init__(self, config, is_cross_attention=False, layer_idx=None, quant_config=None, quant_func=None):
+class GPT2AttentionQ(nn.Module):
+    def __init__(self, config, is_cross_attention=False, layer_idx=None, quant_config: QuantBlockConfig = None, quant_func=None):
         super().__init__()
         self.quant_config = quant_config
         self.quant_func = quant_func
+
+
         self.config = config
         max_positions = config.max_position_embeddings
         self.register_buffer(
@@ -194,8 +198,8 @@ class GPT2Attention(nn.Module):
             self.c_attn = Conv1D(2 * self.embed_dim, self.embed_dim)
             self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
         else:
-            self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
-        self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
+            self.c_attn = QuantLinear(Conv1D(3 * self.embed_dim, self.embed_dim), W_bit=self.quant_config.Attention_W_bit, A_bit=self.quant_config.Attention_A_bit, W_layerwise=self.quant_config.Attention_W_layerwise, A_layerwise=self.quant_config.Attention_A_layerwise, gradclip=self.quant_config.gradclip)
+        self.c_proj = QuantLinear(Conv1D(self.embed_dim, self.embed_dim), W_bit=self.quant_config.Attention_W_bit, A_bit=self.quant_config.Attention_A_bit, W_layerwise=self.quant_config.Attention_W_layerwise, A_layerwise=self.quant_config.Attention_A_layerwise, gradclip=self.quant_config.gradclip)
 
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
@@ -377,12 +381,12 @@ class GPT2Attention(nn.Module):
         return attn_output, attn_weights
 
 
-class GPT2MLP(nn.Module):
-    def __init__(self, intermediate_size, config):
+class GPT2MLPQ(nn.Module):
+    def __init__(self, intermediate_size, config, quant_config: QuantBlockConfig = None):
         super().__init__()
         embed_dim = config.hidden_size
-        self.c_fc = Conv1D(intermediate_size, embed_dim)
-        self.c_proj = Conv1D(embed_dim, intermediate_size)
+        self.c_fc = QuantLinear(Conv1D(intermediate_size, embed_dim), W_bit=quant_config.MLP_W_bit, A_bit=quant_config.MLP_A_bit, W_layerwise=quant_config.MLP_W_layerwise, A_layerwise=quant_config.MLP_A_layerwise, gradclip=quant_config.gradclip)
+        self.c_proj = QuantLinear(Conv1D(embed_dim, intermediate_size), W_bit=quant_config.MLP_W_bit, A_bit=quant_config.MLP_A_bit, W_layerwise=quant_config.MLP_W_layerwise, A_layerwise=quant_config.MLP_A_layerwise, gradclip=quant_config.gradclip)
         self.act = ACT2FN[config.activation_function]
         self.dropout = nn.Dropout(config.resid_pdrop)
 
@@ -395,20 +399,23 @@ class GPT2MLP(nn.Module):
 
 
 class GPT2Block(GradientCheckpointingLayer):
-    def __init__(self, config, layer_idx=None):
+    def __init__(self, config, layer_idx=None, quant_config: QuantBlockConfig = None):
         super().__init__()
         hidden_size = config.hidden_size
         inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
 
+        #this continas the necssary config
+        self.quant_config = quant_config
+
         self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-        self.attn = GPT2Attention(config=config, layer_idx=layer_idx)
+        self.attn = GPT2Attention(config=config, layer_idx=layer_idx, quant_config=quant_config)
         self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
         if config.add_cross_attention:
             self.crossattention = GPT2Attention(config=config, is_cross_attention=True, layer_idx=layer_idx)
             self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
-        self.mlp = GPT2MLP(inner_dim, config)
+        self.mlp = GPT2MLP(inner_dim, config, quant_config=quant_config)
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -709,7 +716,7 @@ DEPARALLELIZE_DOCSTRING = r"""
 class GPT2Model(GPT2PreTrainedModel):
     _supports_param_buffer_assignment = False
 
-    def __init__(self, config):
+    def __init__(self, config, quant_configs: List[QuantBlockConfig] = None):
         super().__init__(config)
 
         self.embed_dim = config.hidden_size
@@ -718,7 +725,7 @@ class GPT2Model(GPT2PreTrainedModel):
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
 
         self.drop = nn.Dropout(config.embd_pdrop)
-        self.h = nn.ModuleList([GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers)])
+        self.h = nn.ModuleList([GPT2Block(config, layer_idx=i, quant_config=quant_configs[i]) for i in range(config.num_hidden_layers)])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         # Model parallel
